@@ -14,11 +14,16 @@ import { Options } from '@/model/Options';
 import {
   aggregateUserDayRecords,
   fetchLatestUserReport,
+  fetchRawUserDayRecords,
   type UserDayRecord,
   type UserTotals
 } from '../services/github-copilot-usage-api';
-import { getLatestUserMetrics } from '../storage/user-metrics-storage';
+import { getUserMetricsByDateRange } from '../storage/user-metrics-storage';
+import { getUserDayMetricsByDateRange } from '../storage/user-day-metrics-storage';
+import { isDbConfigured } from '../storage/db';
 import { fetchAllTeamMembers } from './seats';
+import { restrictUserRowsToSelf } from '../utils/restrict-user-rows';
+import { requireTeamMembershipOrAdmin } from '../utils/team-membership';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 import mockUsersOrg28Day from '../../public/mock-data/new-api/organization-users-28-day-report.json';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -76,10 +81,32 @@ async function filterByTeamIfNeeded(
   return [...activeInTeam, ...inactiveStubs];
 }
 
+/** Filter per-day user records to those falling within the optional date range.
+ * Dates must be ISO 8601 YYYY-MM-DD strings; lexicographic comparison is
+ * equivalent to chronological order for this format.
+ */
+function filterDaysByDateRange(records: UserDayRecord[], since?: string, until?: string): UserDayRecord[] {
+  if (!since && !until) return records;
+  return records.filter(r => {
+    if (since && r.day < since) return false;
+    if (until && r.day > until) return false;
+    return true;
+  });
+}
+
 export default defineEventHandler(async (event) => {
   const logger = console;
   const query = getQuery(event);
   const options = Options.fromQuery(query);
+
+  // GDPR / issue #398 — non-admins may only query teams they belong to.
+  // No-op for admins, PAT-mode operators, and queries without ?githubTeam.
+  await requireTeamMembershipOrAdmin(
+    event,
+    (options.scope || 'organization') as 'organization' | 'enterprise' | 'team-organization' | 'team-enterprise',
+    options.githubOrg,
+    options.githubTeam,
+  );
 
   // ── Mock mode ──────────────────────────────────────────────────────────────
   if (options.isDataMocked) {
@@ -87,7 +114,10 @@ export default defineEventHandler(async (event) => {
     const raw = isOrg ? mockUsersOrg28Day : mockUsersEnt28Day;
     // Org mock uses UserDayRecord[] in day_totals → aggregate on the fly.
     // Enterprise mock uses pre-aggregated UserTotals[] in user_totals → return directly.
-    const dayRecords = (raw as { day_totals?: UserDayRecord[] }).day_totals;
+    const rawDayRecords = (raw as { day_totals?: UserDayRecord[] }).day_totals;
+    const dayRecords = rawDayRecords
+      ? filterDaysByDateRange(rawDayRecords, options.since, options.until)
+      : undefined;
     let userTotals: UserTotals[] = dayRecords
       ? aggregateUserDayRecords(dayRecords)
       : ((raw as { user_totals: UserTotals[] }).user_totals ?? []);
@@ -97,11 +127,11 @@ export default defineEventHandler(async (event) => {
       const members = await filterByTeamIfNeeded(userTotals, options, new Headers());
       userTotals = members;
     }
-    return userTotals;
+    return restrictUserRowsToSelf(event, userTotals, { isMocked: true });
   }
 
   // ── Storage / historical mode ───────────────────────────────────────────────
-  if (process.env.ENABLE_HISTORICAL_MODE === 'true') {
+  if (isDbConfigured()) {
     const isTeamScope = !!options.githubTeam;
 
     // Team-scoped queries require auth to resolve current team membership
@@ -115,11 +145,11 @@ export default defineEventHandler(async (event) => {
     try {
       const scope = options.scope || 'organization';
       const identifier = options.githubOrg || options.githubEnt || '';
-      const stored = await getLatestUserMetrics(scope, identifier);
+      const stored = await getUserMetricsByDateRange(scope, identifier, options.since, options.until);
       if (stored) {
         const filtered = await filterByTeamIfNeeded(stored.userTotals, options, event.context.headers);
         logger.info(`Returning ${filtered.length} user metrics entries from storage (${stored.reportStartDay}–${stored.reportEndDay})`);
-        return filtered;
+        return restrictUserRowsToSelf(event, filtered);
       }
       logger.info('No user metrics in storage yet, attempting live fetch');
     } catch (err) {
@@ -152,15 +182,46 @@ export default defineEventHandler(async (event) => {
 
     logger.info(`Fetching user metrics for ${scope}:${identifier}`);
 
-    const report = await fetchLatestUserReport(
-      { scope, identifier, teamSlug: options.githubTeam },
-      event.context.headers
-    );
+    let userTotals: UserTotals[];
 
-    const userTotals = report.user_totals ?? [];
+    if (options.since || options.until) {
+      // Date range specified.
+      // When DB is configured, prefer per-day records stored there — they cover
+      // arbitrary historical ranges beyond the 28-day live API window.
+      let dayRecords: UserDayRecord[];
+      if (isDbConfigured()) {
+        const since = options.since ?? '1970-01-01';
+        const until = options.until ?? '9999-12-31';
+        dayRecords = await getUserDayMetricsByDateRange(scope, identifier, since, until);
+        // Fall back to the live API if the DB is empty for this range (e.g.
+        // sync hasn't run yet) — better than returning blank.
+        if (dayRecords.length === 0) {
+          dayRecords = await fetchRawUserDayRecords(
+            { scope, identifier, teamSlug: options.githubTeam },
+            event.context.headers
+          );
+        }
+      } else {
+        dayRecords = await fetchRawUserDayRecords(
+          { scope, identifier, teamSlug: options.githubTeam },
+          event.context.headers
+        );
+      }
+      userTotals = aggregateUserDayRecords(
+        filterDaysByDateRange(dayRecords, options.since, options.until)
+      );
+    } else {
+      // No date range: use pre-aggregated report
+      const report = await fetchLatestUserReport(
+        { scope, identifier, teamSlug: options.githubTeam },
+        event.context.headers
+      );
+      userTotals = report.user_totals ?? [];
+    }
+
     const filtered = await filterByTeamIfNeeded(userTotals, options, event.context.headers);
     logger.info(`Returned ${filtered.length} user records for ${scope}:${identifier} (${userTotals.length} before team filter)`);
-    return filtered;
+    return restrictUserRowsToSelf(event, filtered);
 
   } catch (error: unknown) {
     logger.error('Error fetching user metrics:', error);

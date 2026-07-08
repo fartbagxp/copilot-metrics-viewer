@@ -13,6 +13,15 @@
         <v-icon>{{ showDateRange ? 'mdi-calendar-check' : 'mdi-calendar' }}</v-icon>
       </v-btn>
 
+      <v-btn
+        v-if="!signInRequired && isUsageAdmin"
+        icon
+        title="Admin panel"
+        @click="showAdminPanel = true"
+      >
+        <v-icon>mdi-shield-crown</v-icon>
+      </v-btn>
+
       <v-btn icon :title="isDark ? 'Switch to light mode' : 'Switch to dark mode'" @click="toggleTheme">
         <v-icon>{{ isDark ? 'mdi-weather-sunny' : 'mdi-weather-night' }}</v-icon>
       </v-btn>
@@ -84,22 +93,19 @@
 
     </v-toolbar>
 
-      <!-- v3.0 Migration Banner -->
+      <!-- Site-wide announcement banner (NUXT_PUBLIC_ANNOUNCEMENT_MESSAGE) -->
     <v-banner
-      v-if="showMigrationBanner"
+      v-if="showAnnouncementBanner"
       color="info"
       icon="mdi-information"
       lines="two"
-      class="migration-banner"
+      class="announcement-banner"
     >
       <v-banner-text>
-        <strong>v3.0 — New Copilot Usage Metrics API.</strong>
-        Your GitHub App now requires the <strong>"Organization Copilot metrics: Read"</strong> permission.
-        Update at GitHub → Settings → Developer settings → GitHub Apps → Permissions.
-        <a href="https://docs.github.com/en/enterprise-cloud@latest/rest/copilot/copilot-usage-metrics" target="_blank">Learn more</a>
+        <span style="white-space: pre-line">{{ announcementMessage }}</span>
       </v-banner-text>
       <template #actions>
-        <v-btn text="Dismiss" @click="showMigrationBanner = false" />
+        <v-btn text="Dismiss" @click="dismissAnnouncement" />
       </template>
     </v-banner>
 
@@ -149,9 +155,17 @@
 
     <!-- Date Range Selector - shown only when calendar icon toggled -->
     <DateRangeSelector 
-      v-show="showDateRange && tab !== 'seat analysis' && !signInRequired" 
+      v-show="showDateRange && tab !== 'seat analysis' && tab !== 'billing' && !signInRequired" 
       :loading="isLoading"
+      :min-date="dataRange?.earliest"
+      :max-date="dataRange?.latest"
       @date-range-changed="handleDateRangeChange" />
+
+    <!-- Admin panel dialog -->
+    <AdminPanel
+      v-model="showAdminPanel"
+      :query-params="adminQueryParams"
+      @synced="onAdminSynced" />
 
     <!-- Organization info for seats tab -->
     <div v-if="tab === 'seat analysis'" class="organization-info">
@@ -185,7 +199,7 @@
             <NuxtLink
               v-for="provider in activeProviders"
               :key="provider.id"
-              :to="`/auth/${provider.id}`"
+              :to="`${appBaseURL}auth/${provider.id}`"
               external
               class="github-login-button"
             >
@@ -202,8 +216,8 @@
 
 
     <div v-show="!apiError">
-      <v-progress-linear v-show="!metricsReady" indeterminate color="indigo" />
-      <v-window v-show="(metricsReady && metrics.length) || (seatsReady && tab === 'seat analysis') || (userMetricsReady && tab === 'user metrics') || (metricsReady && reportData.length > 0 && (tab === 'languages' || tab === 'editors'))" v-model="tab">
+      <v-progress-linear v-show="!metricsReady && !signInRequired" indeterminate color="indigo" />
+      <v-window v-show="(metricsReady && metrics.length) || (seatsReady && tab === 'seat analysis') || (userMetricsReady && tab === 'user metrics') || tab === 'my usage' || tab === 'billing' || (metricsReady && reportData.length > 0 && (tab === 'languages' || tab === 'editors'))" v-model="tab">
         <v-window-item v-for="item in tabItems" :key="item" :value="item">
           <v-card flat>
             <MetricsViewer v-if="item === getDisplayTabName(itemName)" :metrics="metrics" :report-data="reportData" :date-range-description="dateRangeDescription" :team-name="teamName" />
@@ -240,13 +254,23 @@ v-if="item === 'copilot chat'" :metrics="metrics"
               :query-params="seatsQueryParams"
               :session-email="sessionEmail"
             />
+            <MyUsageViewer
+              v-if="item === 'my usage'"
+              :date-range-description="dateRangeDescription"
+              :query-params="myUsageQueryParams"
+            />
+            <BillingCreditsViewer
+              v-if="item === 'billing' && billingEnabled"
+              :query-params="seatsQueryParams"
+            />
+            <BillingNotConfigured v-else-if="item === 'billing'" />
             <ApiResponse
 v-if="item === 'api response'" :metrics="metrics" :original-metrics="originalMetrics"
               :seats="seats" />
           </v-card>
         </v-window-item>
         <v-alert
-          v-show="(metricsReady && metrics.length == 0 && tab !== 'seat analysis' && tab !== 'user metrics') || (seatsReady && seats.length == 0 && tab === 'seat analysis') || (userMetricsReady && userMetrics.length == 0 && tab === 'user metrics')"
+          v-show="(metricsReady && metrics.length == 0 && tab !== 'seat analysis' && tab !== 'user metrics' && tab !== 'my usage' && tab !== 'billing') || (seatsReady && seats.length == 0 && tab === 'seat analysis') || (userMetricsReady && userMetrics.length == 0 && tab === 'user metrics')"
           density="compact" text="No data available to display" title="No data" type="warning" />
       </v-window>
 
@@ -289,7 +313,11 @@ import AgentActivityViewer from './AgentActivityViewer.vue'
 import PullRequestViewer from './PullRequestViewer.vue'
 import DateRangeSelector from './DateRangeSelector.vue'
 import UserMetricsViewer from './UserMetricsViewer.vue'
+import MyUsageViewer from './MyUsageViewer.vue'
+import BillingCreditsViewer from './BillingCreditsViewer.vue'
+import BillingNotConfigured from './BillingNotConfigured.vue'
 import AiChatPanel from './AiChatPanel.vue'
+import AdminPanel from './AdminPanel.vue'
 import { Options } from '@/model/Options';
 import { useRoute } from 'vue-router';
 import { applyHiddenTabs, applyHistoricalModeFilter } from '@/utils/tabUtils';
@@ -310,14 +338,44 @@ export default defineNuxtComponent({
     PullRequestViewer,
     DateRangeSelector,
     UserMetricsViewer,
-    AiChatPanel
+    MyUsageViewer,
+    BillingCreditsViewer,
+    BillingNotConfigured,
+    AiChatPanel,
+    AdminPanel
+  },
+  computed: {
+    announcementMessage(): string {
+      return (this.config?.public?.announcementMessage as string) || '';
+    },
+    showAnnouncementBanner(): boolean {
+      return !!this.announcementMessage && !this.announcementDismissed;
+    },
   },
   methods: {
+    dismissAnnouncement() {
+      this.announcementDismissed = true;
+      if (import.meta.client) {
+        try {
+          sessionStorage.setItem('announcementDismissed', this.announcementMessage);
+        } catch { /* sessionStorage unavailable */ }
+      }
+    },
     logout() {
       const { clear } = useUserSession()
       this.metrics = [];
       this.seats = [];
       clear();
+    },
+    async onAdminSynced() {
+      // Re-fetch data range bounds, then reload metrics for the current range.
+      await this.fetchDataRange();
+      await this.fetchMetrics();
+      if (this.signInRequired) return;
+      const { execute: executeUserMetrics, data: userMetricsData } = this.userMetricsFetch;
+      await executeUserMetrics();
+      this.userMetrics = (userMetricsData.value as UserTotals[]) || [];
+      this.userMetricsReady = true;
     },
     getDisplayTabName(itemName: string): string {
       return itemName;
@@ -342,6 +400,7 @@ export default defineNuxtComponent({
       await this.fetchMetrics();
 
       // Re-fetch user metrics with updated date range
+      if (this.signInRequired) return;
       const { execute: executeUserMetrics, data: userMetricsData, error: userMetricsError } = this.userMetricsFetch;
       await executeUserMetrics();
       if (userMetricsError.value) {
@@ -374,7 +433,8 @@ export default defineNuxtComponent({
         const queryString = new URLSearchParams(params).toString();
         const apiUrl = queryString ? `/api/metrics?${queryString}` : '/api/metrics';
 
-        const response = await $fetch(apiUrl) as MetricsApiResponse;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const response = await ($fetch as any)(apiUrl) as MetricsApiResponse;
 
         this.metrics = response.metrics || [];
         this.originalMetrics = response.usage || [];
@@ -408,9 +468,11 @@ export default defineNuxtComponent({
           case 500:
             this.apiError = `500 Internal Server Error - most likely a bug in the app. Error: ${error.message}`;
             break;
-          case 403:
-            this.apiError = `403 Forbidden — your account does not have permission to access Copilot metrics for this organization. You need the "Copilot metrics access" role (typically org owner or billing manager).`;
+          case 403: {
+            const ghMessage = (error as any)?.data?.message || error.message || '';
+            this.apiError = `403 Forbidden from GitHub: ${ghMessage}. Common causes: (1) classic PAT missing 'read:org' scope (required for seats and per-user metrics), (2) fine-grained PAT not supported for this endpoint, (3) account lacks org owner / billing manager / Copilot admin role, or (4) PAT not SSO-authorized for this org.`;
             break;
+          }
           default:
             this.apiError = `${error.statusCode} Error: ${error.message}`;
             break;
@@ -454,7 +516,7 @@ export default defineNuxtComponent({
 
   data() {
     return {
-      tabItems: ['languages', 'editors', 'copilot chat', 'agent activity', 'pull requests', 'models', 'seat analysis', 'user metrics', 'api response'],
+      tabItems: ['languages', 'editors', 'copilot chat', 'agent activity', 'pull requests', 'models', 'seat analysis', 'user metrics', 'my usage', 'billing', 'api response'],
       tab: null as string | null,
       dateRangeDescription: 'Over the last 28 days',
       isLoading: false,
@@ -473,8 +535,11 @@ export default defineNuxtComponent({
       userMetrics: [] as UserTotals[],
       userMetricsHistory: [] as UserMetricsHistoryEntry[],
       apiError: undefined as string | undefined,
-      showMigrationBanner: false,
+      announcementDismissed: false,
       showDateRange: false,
+      showAdminPanel: false,
+      billingEnabled: true,
+      isUsageAdmin: true,
       config: null as ReturnType<typeof useRuntimeConfig> | null,
       holidayOptions: {
         excludeHolidays: false,
@@ -486,11 +551,43 @@ export default defineNuxtComponent({
     
     this.config = useRuntimeConfig();
 
+    // Restore prior dismissal of the announcement banner (per-tab session),
+    // keyed on the exact message so a new announcement re-appears.
+    if (import.meta.client && this.announcementMessage) {
+      try {
+        const dismissed = sessionStorage.getItem('announcementDismissed');
+        if (dismissed === this.announcementMessage) {
+          this.announcementDismissed = true;
+        }
+      } catch { /* sessionStorage unavailable */ }
+    }
+
     // Add teams tab for organization/enterprise to allow team comparison
     if (this.itemName === 'organization' || this.itemName === 'enterprise') {
       this.tabItems.splice(1, 0, 'teams'); // Insert after the first tab
     }
-    
+
+    // "My Usage" requires a logged-in user (server filters by session.user.login),
+    // so hide it when authentication is not configured — unless we're in mock
+    // mode, where the server falls back to a fixture user so the tab is
+    // discoverable during local dev / Playwright runs.
+    const isMocked = this.config.public.isDataMocked === true
+      || String(this.config.public.isDataMocked) === 'true';
+    const authRequired = this.config.public.requireAuth
+      || this.config.public.usingGithubAuth
+      || this.config.public.isPublicApp
+      || !!this.config.public.authProviders;
+    if (!authRequired && !isMocked) {
+      this.tabItems = this.tabItems.filter(t => t !== 'my usage');
+    }
+
+    // Strip the "billing" tab unconditionally here; mounted() re-adds it after
+    // probing /api/auth/usage-admin. The probe decides whether to show:
+    //   - the real BillingCreditsViewer (admin + NUXT_GITHUB_BILLING_TOKEN set)
+    //   - the BillingNotConfigured placeholder (anyone, when token unset)
+    //   - nothing (non-admin in a configured deployment)
+    this.tabItems = this.tabItems.filter(t => t !== 'billing');
+
     // Auto-hide teams tab when historical mode is disabled (team metrics require DB)
     this.tabItems = applyHistoricalModeFilter(this.tabItems, this.config.public.enableHistoricalMode as boolean | string);
 
@@ -503,6 +600,34 @@ export default defineNuxtComponent({
     }
   },
   async mounted() {
+    // Probe the admin gate AND billing-token-configured flag. The endpoint never
+    // throws — returns {isUsageAdmin:false} when no session is present or the user
+    // isn't on the allowlist, and {billingEnabled:false} when the deployment has
+    // not configured NUXT_GITHUB_BILLING_TOKEN.
+    //
+    // Tab visibility:
+    //   - billingEnabled === false  → show tab to everyone (renders a
+    //     BillingNotConfigured placeholder explaining how to enable the
+    //     feature). This is a discoverability aid for operators of the
+    //     dashboard who otherwise wouldn't know the tab exists.
+    //   - billingEnabled === true   → admin-only (existing behavior); the tab
+    //     renders the real BillingCreditsViewer.
+    try {
+      const probe = await $fetch<{ isUsageAdmin: boolean; billingEnabled?: boolean }>('/api/auth/usage-admin');
+      this.billingEnabled = probe?.billingEnabled !== false;
+      this.isUsageAdmin = !!probe?.isUsageAdmin;
+      const shouldShowBilling = !this.billingEnabled || !!probe?.isUsageAdmin;
+      if (shouldShowBilling && !this.tabItems.includes('billing')) {
+        // Insert just before 'api response' (or at the end if that tab is hidden)
+        const apiIdx = this.tabItems.indexOf('api response');
+        if (apiIdx >= 0) this.tabItems.splice(apiIdx, 0, 'billing');
+        else this.tabItems.push('billing');
+        // Re-apply hidden-tabs filter so NUXT_PUBLIC_HIDDEN_TABS still wins
+        this.tabItems = applyHiddenTabs(this.tabItems, (this.config!.public.hiddenTabs as string));
+      }
+    } catch {
+      // Probe failures are non-fatal — just leave Billing hidden.
+    }
     // React to client-side navigation between /reportsto/ URLs
     this.$watch(() => (this.route as ReturnType<typeof useRoute>).params.upn, (newUpn: string | string[] | undefined) => {
       if (newUpn && this.tabItems.includes('teams')) {
@@ -579,6 +704,9 @@ export default defineNuxtComponent({
     const isAuthRequired = computed(() => config.public.requireAuth || config.public.usingGithubAuth || config.public.isPublicApp || !!config.public.authProviders);
     const showLogoutButton = computed(() => isAuthRequired.value && loggedIn.value);
     const showAuthInfoDialog = ref(false);
+
+    // Base URL for auth provider links — respects NUXT_APP_BASE_URL for sub-path deployments
+    const appBaseURL = useAppBaseURL();
 
     const PROVIDER_META: Record<string, { label: string; icon: string }> = {
       github: { label: 'GitHub', icon: 'mdi-github' },
@@ -667,6 +795,11 @@ export default defineNuxtComponent({
       return rest;
     });
 
+    const myUsageQueryParams = computed(() => {
+      const options = Options.fromRoute(route.value, dateRange.value.since, dateRange.value.until);
+      return options.toParams();
+    });
+
     const userMetricsFetch = useFetch('/api/user-metrics', {
       server: true,
       immediate: false,
@@ -675,6 +808,28 @@ export default defineNuxtComponent({
         return options.toParams();
       })
     });
+
+    /** Available data range for the current scope — used to clamp the date picker. */
+    const dataRange = ref<{ earliest: string; latest: string; mode: string } | null>(null);
+    const fetchDataRange = async () => {
+      try {
+        const options = Options.fromRoute(route.value);
+        const params = options.toParams();
+        // Only forward identity params (no since/until)
+        const { since: _s, until: _u, ...identity } = params;
+        const qs = new URLSearchParams(identity).toString();
+        dataRange.value = await $fetch<{ earliest: string; latest: string; mode: string }>(
+          `/api/data-range${qs ? '?' + qs : ''}`
+        );
+      } catch (err) {
+        console.warn('Failed to fetch /api/data-range, falling back to client defaults:', err);
+        dataRange.value = null;
+      }
+    };
+    if (!signInRequired.value) {
+      // Fire & forget — DateRangeSelector handles the late-arriving bounds via watch.
+      fetchDataRange();
+    }
 
     const aiQueryParams = computed(() => {
       const options = Options.fromRoute(route.value, dateRange.value.since, dateRange.value.until);
@@ -692,6 +847,15 @@ export default defineNuxtComponent({
         || '';
     });
 
+    /** Identity-only params (scope/org/ent/team) used by the admin panel. */
+    const adminQueryParams = computed<Record<string, string>>(() => {
+      const options = Options.fromRoute(route.value);
+      const p = options.toParams();
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { since: _s, until: _u, ...identity } = p;
+      return identity;
+    });
+
     return {
       isDark,
       toggleTheme,
@@ -699,6 +863,7 @@ export default defineNuxtComponent({
       isAuthRequired,
       showAuthInfoDialog,
       activeProviders,
+      appBaseURL,
       mockedDataMessage,
       itemName,
       displayName,
@@ -715,9 +880,13 @@ export default defineNuxtComponent({
       route,
       seatsCurrentPage,
       seatsQueryParams,
+      myUsageQueryParams,
       aiQueryParams,
       entraEnabled,
       sessionEmail,
+      dataRange,
+      adminQueryParams,
+      fetchDataRange,
     };
   },
 })

@@ -9,6 +9,7 @@
  */
 
 import pg from 'pg';
+export { isDbConfigured } from './db-config';
 const { Pool } = pg;
 import { createPglitePool } from './pglite-adapter';
 import type { DbPool } from './types';
@@ -40,6 +41,12 @@ export function getPool(): DbPool {
   }
   return _pool;
 }
+
+/**
+ * Whether DB-backed historical storage is enabled. Re-exported from db-config.
+ * (Kept here as a comment anchor — the implementation lives in db-config.ts so
+ * modules that only need the flag don't pay the cost of importing `pg`.)
+ */
 
 /**
  * Close the connection pool (for graceful shutdown).
@@ -130,5 +137,102 @@ export async function initSchema(): Promise<void> {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_user_day_metrics_lookup
     ON user_day_metrics (scope, identifier, metrics_date);
+  `);
+
+  // ── Billing CSV ingest (Phase A) ───────────────────────────────────────────
+  // Stores line-level rows downloaded from GitHub's async billing CSV export
+  // (POST /enterprises/{ent}/settings/billing/reports). One row per CSV line:
+  // (enterprise, date, sku, username, organization, repository, model) is
+  // unique in the source CSV (verified empirically against ghms-mfg-us-app-inno).
+  // Overlapping re-runs are idempotent via ON CONFLICT DO UPDATE.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_credit_usage (
+      enterprise                TEXT NOT NULL,
+      date                      DATE NOT NULL,
+      product                   TEXT NOT NULL,
+      sku                       TEXT NOT NULL,
+      username                  TEXT NOT NULL,
+      organization              TEXT NOT NULL DEFAULT '',
+      repository                TEXT NOT NULL DEFAULT '',
+      cost_center_name          TEXT NOT NULL DEFAULT '',
+      model                     TEXT NOT NULL DEFAULT '',
+      unit_type                 TEXT NOT NULL DEFAULT '',
+      applied_cost_per_quantity NUMERIC(20,6) NOT NULL DEFAULT 0,
+      quantity                  NUMERIC(20,6) NOT NULL DEFAULT 0,
+      gross_amount              NUMERIC(20,6) NOT NULL DEFAULT 0,
+      net_amount                NUMERIC(20,6) NOT NULL DEFAULT 0,
+      discount_amount           NUMERIC(20,6) NOT NULL DEFAULT 0,
+      aic_quantity              NUMERIC(20,6) NOT NULL DEFAULT 0,
+      aic_gross_amount          NUMERIC(20,6) NOT NULL DEFAULT 0,
+      total_monthly_quota       NUMERIC(20,6) NOT NULL DEFAULT 0,
+      ingested_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (enterprise, date, sku, username, organization, repository, model)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_bcu_ent_date
+    ON billing_credit_usage (enterprise, date);
+  `);
+
+  // Partial index so the username-filtered queries used by the per-user
+  // breakdown never have to scan un-attributed rows.
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_bcu_ent_user
+    ON billing_credit_usage (enterprise, username)
+    WHERE username <> '';
+  `);
+
+  // Audit / state for billing CSV export jobs. Mirrors the sync_status pattern.
+  // Single-flight is enforced at the DB layer by the partial unique index
+  // below — concurrent insert attempts collide and we surface a 409 instead.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_csv_sync_status (
+      id                  SERIAL PRIMARY KEY,
+      enterprise          TEXT NOT NULL,
+      start_date          DATE NOT NULL,
+      end_date            DATE NOT NULL,
+      github_job_id       TEXT,
+      status              TEXT NOT NULL,
+      rows_ingested       INTEGER NOT NULL DEFAULT 0,
+      download_url_count  INTEGER NOT NULL DEFAULT 0,
+      error_message       TEXT,
+      triggered_by        TEXT,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at        TIMESTAMPTZ
+    );
+  `);
+
+  // Observability columns added in v3.13: surface which sub-ranges this job
+  // actually fetched vs skipped (because gap-mode found existing coverage).
+  // Both are arrays of {start, end} ISO date ranges. NULL = "data predates
+  // this column" (don't infer anything).
+  await pool.query(`
+    ALTER TABLE billing_csv_sync_status
+    ADD COLUMN IF NOT EXISTS chunks_fetched JSONB,
+    ADD COLUMN IF NOT EXISTS gaps_skipped   JSONB;
+  `);
+
+  // Soft-dismiss column (v3.13): admins can hide noisy/old job rows from the
+  // recent-jobs UI without deleting them — the row stays so gap-mode coverage
+  // detection (which keys off status='completed' rows) keeps working.
+  await pool.query(`
+    ALTER TABLE billing_csv_sync_status
+    ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_bcss_ent_created
+    ON billing_csv_sync_status (enterprise, created_at DESC);
+  `);
+
+  // Partial unique index — at most one in-flight job per enterprise.
+  // GitHub also enforces enterprise-wide single-flight server-side
+  // (verified A.0 probe — concurrent POST returns 409); our DB index aligns.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_bcss_one_inflight
+    ON billing_csv_sync_status (enterprise)
+    WHERE status IN ('queued','processing','downloading','upserting');
   `);
 }

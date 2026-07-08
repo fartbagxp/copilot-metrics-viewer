@@ -4,8 +4,17 @@
  */
 
 import { syncMetricsForDate, syncMetricsForDateRange, syncGaps, syncBulk } from '../../services/sync-service';
+import { clearFailedSyncsForScope, getFailedSyncsForScope } from '../../storage/sync-storage';
 import { Options } from '@/model/Options';
 import { isMockMode } from '../../services/github-copilot-usage-api-mock';
+import { requireUsageAdmin } from '../../utils/usage-admin';
+import {
+  createBillingCsvJob,
+  cancelInFlightBillingCsvJobs,
+  dismissBillingCsvJob,
+  BillingCsvJobInFlightError,
+} from '../../storage/billing-csv-sync-status-storage';
+import { runBillingCsvIngester } from '../../services/billing-csv-ingester';
 
 export default defineEventHandler(async (event) => {
   const logger = console;
@@ -138,6 +147,151 @@ export default defineEventHandler(async (event) => {
           action: 'sync-last-28',
           ...bulkResult
         };
+      }
+
+      case 'retry-failed': {
+        // Re-attempt every sync_status row in 'failed' state for this scope.
+        const identifier = options.githubOrg || options.githubEnt || 'unknown';
+        const failed = await getFailedSyncsForScope(options.scope!, identifier, options.githubTeam);
+
+        if (failed.length === 0) {
+          return { action: 'retry-failed', retried: 0, successCount: 0, failureCount: 0, results: [] };
+        }
+
+        logger.info(`Retrying ${failed.length} failed sync(s) for ${options.scope}:${identifier}`);
+        const results = [];
+        for (const entry of failed) {
+          const r = await syncMetricsForDate({
+            scope: options.scope!,
+            identifier,
+            date: entry.metricsDate,
+            teamSlug: options.githubTeam,
+            headers,
+          });
+          results.push(r);
+        }
+
+        const successCount = results.filter(r => r.success).length;
+        return {
+          action: 'retry-failed',
+          retried: failed.length,
+          successCount,
+          failureCount: failed.length - successCount,
+          results,
+        };
+      }
+
+      case 'clear-failed': {
+        const scope = options.scope === 'enterprise' ? 'enterprise' : 'organization';
+        const identifier = options.githubOrg || options.githubEnt;
+        if (!identifier) {
+          throw createError({ statusCode: 400, statusMessage: 'organization or enterprise identifier required' });
+        }
+        const removed = await clearFailedSyncsForScope(scope, identifier, options.githubTeam);
+        logger.info(`Cleared ${removed} failed sync row(s) for ${scope}:${identifier}`);
+        return { action: 'clear-failed', removed };
+      }
+
+      case 'sync-billing-csv':
+      case 'sync-billing-csv-range': {
+        // Admin-only fire-and-forget CSV ingest. Returns {jobId,status:'queued'}
+        // immediately; UI polls /api/admin/sync-status for completion.
+        await requireUsageAdmin(event);
+        const config = useRuntimeConfig();
+        const token = (((config as Record<string, unknown>).githubBillingToken as string | undefined) || '').trim();
+        const enterprise = (((config as Record<string, unknown>).billingEnterprise as string | undefined) || '').trim();
+        if (!token) {
+          throw createError({ statusCode: 503, statusMessage: 'NUXT_GITHUB_BILLING_TOKEN not configured' });
+        }
+        if (!enterprise) {
+          throw createError({ statusCode: 503, statusMessage: 'NUXT_BILLING_ENTERPRISE not configured' });
+        }
+
+        let startDate: string;
+        let endDate: string;
+        if (action === 'sync-billing-csv-range') {
+          if (!options.since || !options.until) {
+            throw createError({ statusCode: 400, statusMessage: 'since and until parameters required for sync-billing-csv-range' });
+          }
+          startDate = options.since;
+          endDate = options.until;
+        } else {
+          // Default 30-day window ending today.
+          const daysBack = Number(process.env.BILLING_CSV_DAYS_BACK || 30);
+          const end = new Date();
+          const start = new Date(end.getTime() - (daysBack - 1) * 24 * 60 * 60 * 1000);
+          startDate = start.toISOString().slice(0, 10);
+          endDate = end.toISOString().slice(0, 10);
+        }
+
+        let triggeredBy = 'admin';
+        try {
+          const session = await getUserSession(event);
+          if (session?.user?.login) triggeredBy = String(session.user.login);
+        } catch { /* anonymous PAT-mode caller */ }
+
+        let job;
+        try {
+          job = await createBillingCsvJob({ enterprise, startDate, endDate, triggeredBy });
+        } catch (e) {
+          if (e instanceof BillingCsvJobInFlightError) {
+            throw createError({ statusCode: 409, statusMessage: e.message });
+          }
+          throw e;
+        }
+
+        // Fire-and-forget. The ingester catches all errors and records them
+        // on the job row; we just need to make sure unhandled rejections
+        // don't crash the process.
+        const fillGapsOnly = params.fillGapsOnly === true
+          || params.fillGapsOnly === 'true'
+          || params.fillGapsOnly === '1';
+        void runBillingCsvIngester({ token, jobId: job.id, fillGapsOnly }).catch(err => {
+          logger.error(`Billing CSV ingest job ${job.id} crashed:`, err);
+        });
+
+        return {
+          action,
+          jobId: job.id,
+          enterprise,
+          startDate,
+          endDate,
+          fillGapsOnly,
+          status: 'queued',
+        };
+      }
+
+      case 'sync-billing-csv-cancel': {
+        // Marks all in-flight jobs for the configured enterprise as cancelled.
+        // The ingester does not check for cancellation mid-flight (would
+        // require interrupting an in-flight HTTP poll/download); this is
+        // primarily a UX escape hatch so the UI can clear a stuck-looking
+        // job from the status panel. A truly stuck job's cancellation lets
+        // the next trigger proceed without 409'ing on the single-flight
+        // unique index.
+        await requireUsageAdmin(event);
+        const config = useRuntimeConfig();
+        const enterprise = (((config as Record<string, unknown>).billingEnterprise as string | undefined) || '').trim();
+        if (!enterprise) {
+          throw createError({ statusCode: 503, statusMessage: 'NUXT_BILLING_ENTERPRISE not configured' });
+        }
+        const cancelled = await cancelInFlightBillingCsvJobs(enterprise);
+        return { action, cancelled };
+      }
+
+      case 'sync-billing-csv-dismiss': {
+        // Soft-dismiss a finished job so it stops cluttering the recent-jobs
+        // table. The row is kept in the DB so gap-mode coverage detection
+        // (which queries status='completed' rows) keeps working. Refuses to
+        // dismiss in-flight jobs — the user should cancel those first.
+        await requireUsageAdmin(event);
+        const rawId = params.jobId;
+        const jobId = typeof rawId === 'number' ? rawId : Number.parseInt(String(rawId ?? ''), 10);
+        if (!Number.isInteger(jobId) || jobId <= 0) {
+          throw createError({ statusCode: 400, statusMessage: 'jobId (positive integer) required' });
+        }
+        const dismissed = await dismissBillingCsvJob(jobId);
+        return { action, jobId, dismissed };
       }
 
       default:

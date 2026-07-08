@@ -81,6 +81,7 @@ vi.mock('../server/services/github-copilot-usage-api', async (importOriginal) =>
   return {
     ...(actual as object),
     fetchLatestUserReport: vi.fn(async () => SAMPLE_USER_REPORT),
+    fetchRawUserDayRecords: vi.fn(async () => []),
     fetchUserReportForDate: vi.fn(async () => ({
       ...SAMPLE_USER_REPORT,
       report_start_day: '2026-03-03',
@@ -335,43 +336,81 @@ describe('UserTotals business logic', () => {
 });
 
 // ── Multi-file merging (large-enterprise support) ─────────────────────────────
+// GitHub returns per-user reports split across multiple download files for
+// large orgs. Each file contains its own `user_totals` (aggregated only over
+// that file's date subset) plus per-day rows. If we naively flatMap the
+// per-file `user_totals` we double-count users that appear in more than one
+// file — see issue #398 (reporter saw 3,401 "total users" for an org with
+// ~200 Copilot seats).
+//
+// The fix (`fetchLatestUserReport` / `fetchUserReportForDate`) re-derives
+// `user_totals` from the merged `day_totals` via `aggregateUserDayRecords`
+// whenever `reports.length > 1`. These tests exercise that dedup path.
 
 describe('User report merging for large enterprises', () => {
-  it('merges user_totals arrays from multiple download files', () => {
-    // Simulate split report — two files each with different users
-    const file1: UserReport = {
+  it('re-aggregates user_totals from merged day_totals when the same user appears in multiple files (#398)', () => {
+    // Same user in two files with 2 days each — the naive flatMap would emit
+    // two rows for octocat and inflate downstream counts.
+    const day1: UserDayRecord = {
+      user_login: 'octocat',
+      user_id: 1,
+      day: '2026-02-04',
       report_start_day: '2026-02-04',
       report_end_day: '2026-03-03',
       organization_id: '100000001',
-      user_totals: [SAMPLE_USER_REPORT.user_totals[0]!],  // octocat
+      enterprise_id: '200001',
+      user_initiated_interaction_count: 10,
+      code_generation_activity_count: 30,
+      code_acceptance_activity_count: 20,
+      loc_suggested_to_add_sum: 100,
+      loc_suggested_to_delete_sum: 5,
+      loc_added_sum: 70,
+      loc_deleted_sum: 3,
     };
-    const file2: UserReport = {
-      report_start_day: '2026-02-04',
-      report_end_day: '2026-03-03',
-      organization_id: '100000001',
-      user_totals: [SAMPLE_USER_REPORT.user_totals[1]!],  // octokitten
-    };
+    const day2: UserDayRecord = { ...day1, day: '2026-02-05', user_initiated_interaction_count: 15, code_generation_activity_count: 40 };
+    const day3: UserDayRecord = { ...day1, day: '2026-02-18', user_initiated_interaction_count: 20, code_generation_activity_count: 50 };
+    const day4: UserDayRecord = { ...day1, day: '2026-02-19', user_initiated_interaction_count: 25, code_generation_activity_count: 60 };
 
-    // Same logic as fetchLatestUserReport
-    const reports = [file1, file2];
-    const merged: UserReport = { ...reports[0]! };
-    merged.user_totals = reports.flatMap(r => r.user_totals);
+    // First file covers early Feb, second covers mid-Feb — same octocat in both.
+    const mergedDayTotals = [day1, day2, day3, day4];
+    const deduped = aggregateUserDayRecords(mergedDayTotals);
 
-    expect(merged.user_totals).toHaveLength(2);
-    expect(merged.user_totals.map(u => u.login)).toContain('octocat');
-    expect(merged.user_totals.map(u => u.login)).toContain('octokitten');
-    expect(merged.report_start_day).toBe('2026-02-04');
-    expect(merged.report_end_day).toBe('2026-03-03');
+    expect(deduped).toHaveLength(1);
+    expect(deduped[0]!.login).toBe('octocat');
+    expect(deduped[0]!.total_active_days).toBe(4);
+    expect(deduped[0]!.user_initiated_interaction_count).toBe(70); // 10 + 15 + 20 + 25
+    expect(deduped[0]!.code_generation_activity_count).toBe(180);  // 30 + 40 + 50 + 60
   });
 
-  it('handles single-file report without merging', () => {
-    const reports = [SAMPLE_USER_REPORT];
-    const merged: UserReport = { ...reports[0]! };
-    if (reports.length > 1) {
-      merged.user_totals = reports.flatMap(r => r.user_totals);
-    }
+  it('preserves distinct users across files (disjoint case)', () => {
+    const octocatDay: UserDayRecord = {
+      user_login: 'octocat',
+      user_id: 1,
+      day: '2026-02-04',
+      report_start_day: '2026-02-04',
+      report_end_day: '2026-03-03',
+      organization_id: '100000001',
+      enterprise_id: '200001',
+      user_initiated_interaction_count: 10,
+      code_generation_activity_count: 20,
+      code_acceptance_activity_count: 10,
+      loc_suggested_to_add_sum: 50,
+      loc_suggested_to_delete_sum: 0,
+      loc_added_sum: 30,
+      loc_deleted_sum: 0,
+    };
+    const octokittenDay: UserDayRecord = { ...octocatDay, user_login: 'octokitten', user_id: 2 };
 
-    expect(merged.user_totals).toHaveLength(SAMPLE_USER_REPORT.user_totals.length);
+    const deduped = aggregateUserDayRecords([octocatDay, octokittenDay]);
+    expect(deduped).toHaveLength(2);
+    expect(deduped.map(u => u.login).sort()).toEqual(['octocat', 'octokitten']);
+  });
+
+  it('SAMPLE_USER_REPORT sanity: uses distinct logins so a single-file report needs no dedup', () => {
+    // Guardrail — if we ever add a duplicate row to SAMPLE_USER_REPORT this
+    // test starts failing and the fixture stays honest.
+    const logins = SAMPLE_USER_REPORT.user_totals.map(u => u.login);
+    expect(new Set(logins).size).toBe(logins.length);
   });
 });
 
@@ -442,12 +481,29 @@ describe('User report payload field names match real GitHub API', () => {
 ;(globalThis as any).getQuery = (_event: any) => ({ scope: 'organization', githubOrg: 'test-org' })
 
 // Storage mock — individual functions are re-configured per test via vi.fn().
-const mockGetLatestUserMetrics = vi.fn()
+const mockGetUserMetricsByDateRange = vi.fn()
 
 vi.mock('../server/storage/user-metrics-storage', () => ({
-  getLatestUserMetrics: (...args: any[]) => mockGetLatestUserMetrics(...args),
+  getUserMetricsByDateRange: (...args: any[]) => mockGetUserMetricsByDateRange(...args),
+  getLatestUserMetrics: vi.fn(),
   getUserMetricsHistory: vi.fn(async () => []),
   getUserTimeSeries: vi.fn(async () => []),
+}))
+
+// DB-layer mocks for the live-API-path DB-first tests
+const mockIsDbConfigured = vi.fn(() => !!process.env.DATABASE_URL)
+const mockGetUserDayMetricsByDateRange = vi.fn(async (..._args: unknown[]) => [] as UserDayRecord[])
+
+vi.mock('../server/storage/db', () => ({
+  isDbConfigured: () => mockIsDbConfigured(),
+  getPool: vi.fn(),
+}))
+
+vi.mock('../server/storage/user-day-metrics-storage', () => ({
+  getUserDayMetricsByDateRange: (...args: any[]) => mockGetUserDayMetricsByDateRange(...args),
+  saveUserDayMetricsBatch: vi.fn(),
+  hasUserDayMetricsForDate: vi.fn(),
+  baseScope: (s: string) => s.replace(/^team-/, ''),
 }))
 
 /** Build a minimal H3-style event with/without an Authorization header. */
@@ -458,18 +514,18 @@ function makeEvent(withAuth: boolean): any {
 }
 
 describe('/api/user-metrics handler – historical mode fallback', () => {
-  const ORIGINAL_HISTORICAL = process.env.ENABLE_HISTORICAL_MODE
+  const ORIGINAL_DBURL = process.env.DATABASE_URL
   const ORIGINAL_MOCKED = process.env.NUXT_PUBLIC_IS_DATA_MOCKED
 
   beforeEach(() => {
     vi.clearAllMocks()
-    process.env.ENABLE_HISTORICAL_MODE = 'true'
+    process.env.DATABASE_URL = 'postgres://test'
     process.env.NUXT_PUBLIC_IS_DATA_MOCKED = 'false'
   })
 
   afterEach(() => {
-    if (ORIGINAL_HISTORICAL === undefined) delete process.env.ENABLE_HISTORICAL_MODE
-    else process.env.ENABLE_HISTORICAL_MODE = ORIGINAL_HISTORICAL
+    if (ORIGINAL_DBURL === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = ORIGINAL_DBURL
     if (ORIGINAL_MOCKED === undefined) delete process.env.NUXT_PUBLIC_IS_DATA_MOCKED
     else process.env.NUXT_PUBLIC_IS_DATA_MOCKED = ORIGINAL_MOCKED
   })
@@ -480,24 +536,51 @@ describe('/api/user-metrics handler – historical mode fallback', () => {
       reportEndDay: '2026-04-01',
       userTotals: [SAMPLE_USER_REPORT.user_totals[0]],
     }
-    mockGetLatestUserMetrics.mockResolvedValue(stored)
+    mockGetUserMetricsByDateRange.mockResolvedValue(stored)
 
     const { default: handler } = await import('../server/api/user-metrics')
     const result = await handler(makeEvent(false))
 
     expect(result).toEqual(stored.userTotals)
-    expect(mockGetLatestUserMetrics).toHaveBeenCalledWith('organization', 'test-org')
+    expect(mockGetUserMetricsByDateRange).toHaveBeenCalledWith('organization', 'test-org', undefined, undefined)
+  })
+
+  it('passes since/until params to storage when date range is specified', async () => {
+    const stored = {
+      reportStartDay: '2026-06-01',
+      reportEndDay: '2026-06-12',
+      userTotals: [SAMPLE_USER_REPORT.user_totals[0]],
+    }
+    mockGetUserMetricsByDateRange.mockResolvedValue(stored)
+
+    const ORIGINAL_GET_QUERY = (globalThis as any).getQuery
+    ;(globalThis as any).getQuery = () => ({
+      scope: 'organization',
+      githubOrg: 'test-org',
+      since: '2026-06-01',
+      until: '2026-06-12',
+    })
+
+    try {
+      const { default: handler } = await import('../server/api/user-metrics')
+      const result = await handler(makeEvent(false))
+
+      expect(result).toEqual(stored.userTotals)
+      expect(mockGetUserMetricsByDateRange).toHaveBeenCalledWith('organization', 'test-org', '2026-06-01', '2026-06-12')
+    } finally {
+      ;(globalThis as any).getQuery = ORIGINAL_GET_QUERY
+    }
   })
 
   it('throws 503 when DB fails and no Authorization header is present', async () => {
-    mockGetLatestUserMetrics.mockRejectedValue(new Error('SASL: client password must be a string'))
+    mockGetUserMetricsByDateRange.mockRejectedValue(new Error('SASL: client password must be a string'))
 
     const { default: handler } = await import('../server/api/user-metrics')
     await expect(handler(makeEvent(false))).rejects.toMatchObject({ statusCode: 503 })
   })
 
   it('falls back to live API when DB fails but Authorization header is present', async () => {
-    mockGetLatestUserMetrics.mockRejectedValue(new Error('SASL: client password must be a string'))
+    mockGetUserMetricsByDateRange.mockRejectedValue(new Error('SASL: client password must be a string'))
 
     // fetchLatestUserReport is mocked at the top of this file to return SAMPLE_USER_REPORT.
     const { default: handler } = await import('../server/api/user-metrics')
@@ -510,15 +593,15 @@ describe('/api/user-metrics handler – historical mode fallback', () => {
 // ── /api/user-metrics-history handler — graceful DB failure ──────────────────
 
 describe('/api/user-metrics-history handler – storage failure returns empty array', () => {
-  const ORIGINAL_HISTORICAL = process.env.ENABLE_HISTORICAL_MODE
+  const ORIGINAL_DBURL = process.env.DATABASE_URL
 
   beforeEach(() => {
-    process.env.ENABLE_HISTORICAL_MODE = 'true'
+    process.env.DATABASE_URL = 'postgres://test'
   })
 
   afterEach(() => {
-    if (ORIGINAL_HISTORICAL === undefined) delete process.env.ENABLE_HISTORICAL_MODE
-    else process.env.ENABLE_HISTORICAL_MODE = ORIGINAL_HISTORICAL
+    if (ORIGINAL_DBURL === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = ORIGINAL_DBURL
   })
 
   it('returns [] instead of throwing 500 when getUserMetricsHistory rejects', async () => {
@@ -570,13 +653,13 @@ vi.mock('../server/api/seats', () => ({
 }))
 
 describe('/api/user-metrics handler – team filtering', () => {
-  const ORIGINAL_HISTORICAL = process.env.ENABLE_HISTORICAL_MODE
+  const ORIGINAL_DBURL = process.env.DATABASE_URL
   const ORIGINAL_MOCKED = process.env.NUXT_PUBLIC_IS_DATA_MOCKED
   const ORIGINAL_GET_QUERY = (globalThis as any).getQuery
 
   beforeEach(() => {
     vi.clearAllMocks()
-    process.env.ENABLE_HISTORICAL_MODE = 'true'
+    process.env.DATABASE_URL = 'postgres://test'
     process.env.NUXT_PUBLIC_IS_DATA_MOCKED = 'false'
     mockFetchAllTeamMembers.mockResolvedValue([
       { login: 'octocat', id: 1 },
@@ -584,8 +667,8 @@ describe('/api/user-metrics handler – team filtering', () => {
   })
 
   afterEach(() => {
-    if (ORIGINAL_HISTORICAL === undefined) delete process.env.ENABLE_HISTORICAL_MODE
-    else process.env.ENABLE_HISTORICAL_MODE = ORIGINAL_HISTORICAL
+    if (ORIGINAL_DBURL === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = ORIGINAL_DBURL
     if (ORIGINAL_MOCKED === undefined) delete process.env.NUXT_PUBLIC_IS_DATA_MOCKED
     else process.env.NUXT_PUBLIC_IS_DATA_MOCKED = ORIGINAL_MOCKED
     ;(globalThis as any).getQuery = ORIGINAL_GET_QUERY
@@ -605,7 +688,7 @@ describe('/api/user-metrics handler – team filtering', () => {
       reportEndDay: '2026-04-01',
       userTotals: SAMPLE_USER_REPORT.user_totals, // octocat (id:1) + octokitten (id:2)
     }
-    mockGetLatestUserMetrics.mockResolvedValue(stored)
+    mockGetUserMetricsByDateRange.mockResolvedValue(stored)
 
     // Team has only octocat (id:1)
     mockFetchAllTeamMembers.mockResolvedValue([{ login: 'octocat', id: 1 }])
@@ -630,7 +713,7 @@ describe('/api/user-metrics handler – team filtering', () => {
       reportEndDay: '2026-04-01',
       userTotals: SAMPLE_USER_REPORT.user_totals,
     }
-    mockGetLatestUserMetrics.mockResolvedValue(stored)
+    mockGetUserMetricsByDateRange.mockResolvedValue(stored)
 
     const { default: handler } = await import('../server/api/user-metrics')
     const result = await handler(makeEvent(false))
@@ -663,7 +746,7 @@ describe('/api/user-metrics handler – team filtering', () => {
       reportEndDay: '2026-04-01',
       userTotals: SAMPLE_USER_REPORT.user_totals,
     }
-    mockGetLatestUserMetrics.mockResolvedValue(stored)
+    mockGetUserMetricsByDateRange.mockResolvedValue(stored)
     mockFetchAllTeamMembers.mockResolvedValue([])
 
     const { default: handler } = await import('../server/api/user-metrics')
@@ -685,7 +768,7 @@ describe('/api/user-metrics handler – team filtering', () => {
       reportEndDay: '2026-04-01',
       userTotals: SAMPLE_USER_REPORT.user_totals,
     }
-    mockGetLatestUserMetrics.mockResolvedValue(stored)
+    mockGetUserMetricsByDateRange.mockResolvedValue(stored)
     // Team member has uppercase login but matching user_id
     mockFetchAllTeamMembers.mockResolvedValue([{ login: 'OCTOKITTEN', id: 2 }])
 
@@ -710,7 +793,7 @@ describe('/api/user-metrics handler – team filtering', () => {
       reportEndDay: '2026-04-01',
       userTotals: [SAMPLE_USER_REPORT.user_totals[0]], // only octocat (id:1)
     }
-    mockGetLatestUserMetrics.mockResolvedValue(stored)
+    mockGetUserMetricsByDateRange.mockResolvedValue(stored)
     mockFetchAllTeamMembers.mockResolvedValue([
       { login: 'octocat', id: 1 },       // active — has real usage data
       { login: 'inactiveuser', id: 99 },  // inactive — no usage data in storage
@@ -733,5 +816,114 @@ describe('/api/user-metrics handler – team filtering', () => {
     expect(inactive.user_initiated_interaction_count).toBe(0)
     expect(inactive.code_generation_activity_count).toBe(0)
     expect(inactive.code_acceptance_activity_count).toBe(0)
+  })
+})
+
+// ── /api/user-metrics handler — live API path DB-first for date ranges > 28 days ──
+//
+// When a date range is specified and DB is configured, the live API path must
+// query the DB first (covering arbitrary historical ranges), falling back to the
+// 28-day live API only when the DB is empty for that range.
+// Regression for: USER METRICS date filter capped at 28 days (issue #403).
+
+import { fetchRawUserDayRecords as _fetchRawUserDayRecords } from '../server/services/github-copilot-usage-api'
+const mockFetchRawUserDayRecords = vi.mocked(_fetchRawUserDayRecords)
+
+describe('/api/user-metrics handler – live path DB-first when date range > 28 days', () => {
+  const ORIGINAL_DBURL = process.env.DATABASE_URL
+  const ORIGINAL_MOCKED = process.env.NUXT_PUBLIC_IS_DATA_MOCKED
+  const ORIGINAL_GET_QUERY = (globalThis as any).getQuery
+
+  // Minimal set of UserDayRecords spanning 40 days (> 28)
+  const DB_DAY_RECORDS: UserDayRecord[] = (() => {
+    const records: UserDayRecord[] = []
+    const baseDate = new Date('2026-04-15')
+    for (let i = 0; i < 40; i++) {
+      const d = new Date(baseDate)
+      d.setDate(d.getDate() + i)
+      const day = d.toISOString().slice(0, 10)
+      records.push({
+        report_start_day: '2026-04-15', report_end_day: '2026-05-24',
+        day,
+        organization_id: '100', enterprise_id: '', user_id: 1, user_login: 'octocat',
+        user_initiated_interaction_count: 2, code_generation_activity_count: 5,
+        code_acceptance_activity_count: 3, loc_suggested_to_add_sum: 10,
+        loc_suggested_to_delete_sum: 0, loc_added_sum: 8, loc_deleted_sum: 0,
+      })
+    }
+    return records
+  })()
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // Historical mode is OFF — we're testing the live path
+    delete process.env.DATABASE_URL
+    process.env.NUXT_PUBLIC_IS_DATA_MOCKED = 'false'
+    ;(globalThis as any).getQuery = () => ({
+      scope: 'organization',
+      githubOrg: 'test-org',
+      since: '2026-04-15',
+      until: '2026-05-24', // 40-day range, well beyond 28 days
+    })
+    // Historical mode storage returns null (not called in live path anyway)
+    mockGetUserMetricsByDateRange.mockResolvedValue(null)
+  })
+
+  afterEach(() => {
+    if (ORIGINAL_DBURL === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = ORIGINAL_DBURL
+    if (ORIGINAL_MOCKED === undefined) delete process.env.NUXT_PUBLIC_IS_DATA_MOCKED
+    else process.env.NUXT_PUBLIC_IS_DATA_MOCKED = ORIGINAL_MOCKED
+    ;(globalThis as any).getQuery = ORIGINAL_GET_QUERY
+  })
+
+  it('uses DB records when DB is configured and has data for the date range', async () => {
+    mockIsDbConfigured.mockReturnValue(true)
+    mockGetUserDayMetricsByDateRange.mockResolvedValue(DB_DAY_RECORDS)
+
+    const { default: handler } = await import('../server/api/user-metrics')
+    const result = (await handler(makeEvent(true))) as any[]
+
+    // DB was queried for the full range
+    expect(mockGetUserDayMetricsByDateRange).toHaveBeenCalledWith(
+      'organization', 'test-org', '2026-04-15', '2026-05-24'
+    )
+    // Live API was NOT called because DB had data
+    expect(mockFetchRawUserDayRecords).not.toHaveBeenCalled()
+    // Result contains aggregated data for all 40 days
+    expect(Array.isArray(result)).toBe(true)
+    expect(result).toHaveLength(1)
+    expect((result[0] as any).login).toBe('octocat')
+    expect((result[0] as any).total_active_days).toBe(40)
+  })
+
+  it('falls back to live API (28-day) when DB is configured but empty for the range', async () => {
+    mockIsDbConfigured.mockReturnValue(true)
+    mockGetUserDayMetricsByDateRange.mockResolvedValue([]) // DB empty
+
+    // Live API returns some data (mocked)
+    mockFetchRawUserDayRecords.mockResolvedValue(DB_DAY_RECORDS.slice(0, 28))
+
+    const { default: handler } = await import('../server/api/user-metrics')
+    const result = (await handler(makeEvent(true))) as any[]
+
+    // DB was tried first
+    expect(mockGetUserDayMetricsByDateRange).toHaveBeenCalled()
+    // Live API was called as fallback
+    expect(mockFetchRawUserDayRecords).toHaveBeenCalled()
+    expect(Array.isArray(result)).toBe(true)
+  })
+
+  it('uses live API directly when DB is not configured', async () => {
+    mockIsDbConfigured.mockReturnValue(false)
+    mockFetchRawUserDayRecords.mockResolvedValue(DB_DAY_RECORDS.slice(0, 28))
+
+    const { default: handler } = await import('../server/api/user-metrics')
+    await handler(makeEvent(true))
+
+    // DB was never queried
+    expect(mockGetUserDayMetricsByDateRange).not.toHaveBeenCalled()
+    // Live API was called directly
+    expect(mockFetchRawUserDayRecords).toHaveBeenCalled()
   })
 })

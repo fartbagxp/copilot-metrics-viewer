@@ -195,16 +195,8 @@
                                     "value": "3000"
                                 },
                                 {
-                                    "name": "ENABLE_HISTORICAL_MODE",
-                                    "value": "true"
-                                },
-                                {
                                     "name": "DATABASE_URL",
                                     "secretRef": "database-url"
-                                },
-                                {
-                                    "name": "SYNC_ENABLED",
-                                    "value": "false"
                                 }
                             ]
                         }
@@ -275,10 +267,6 @@
                                 {
                                     "name": "DATABASE_URL",
                                     "secretRef": "database-url"
-                                },
-                                {
-                                    "name": "SYNC_ENABLED",
-                                    "value": "true"
                                 },
                                 {
                                     "name": "SYNC_DAYS_BACK",

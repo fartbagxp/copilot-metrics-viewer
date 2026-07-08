@@ -76,11 +76,11 @@ export default defineNuxtConfig({
       'plugins/http-agent',
       'plugins/db-init',
     ],
-    // Scheduled sync is handled by the dedicated sync Docker container (Dockerfile.sync).
-    // Do not register scheduledTasks here to avoid Nitro "task not defined" warnings.
   },
   runtimeConfig: {
     githubToken: '',
+    githubBillingToken: '',     // NUXT_GITHUB_BILLING_TOKEN — dedicated classic PAT for billing endpoints (manage_billing:enterprise + SSO-authorized). Absent → Billing tab is hidden.
+    billingEnterprise: '',      // NUXT_BILLING_ENTERPRISE — enterprise slug to query for billing (overrides dashboard scope; needed when an org's billing is consolidated at an enterprise).
     githubApiBaseUrl: '',       // NUXT_GITHUB_API_BASE_URL — override for GHE.com (e.g. https://api.SUBDOMAIN.ghe.com)
     aiToken: '',  // Dedicated token for GitHub Models API (NUXT_AI_TOKEN). Falls back to githubToken.
     aiModel: 'gpt-4o',  // Model for AI chat (NUXT_AI_MODEL)
@@ -122,6 +122,9 @@ export default defineNuxtConfig({
     // Server-only authorization config (NUXT_AUTHORIZED_USERS, NUXT_AUTHORIZED_EMAIL_DOMAINS)
     authorizedUsers: '',
     authorizedEmailDomains: '',
+    // Server-only admin allowlist for the per-user billing breakdown tab
+    // (NUXT_USAGE_ADMINS). Closed-by-default: empty list = nobody is admin.
+    usageAdmins: '',
     public: {
       isDataMocked: false,  // can be overridden by NUXT_PUBLIC_IS_DATA_MOCKED environment variable
       scope: 'organization',  // can be overridden by NUXT_PUBLIC_SCOPE environment variable
@@ -140,11 +143,18 @@ export default defineNuxtConfig({
       deployInfo: '',
       // New API migration flags
       useLegacyApi: false,  // Set true to use deprecated /copilot/metrics API (USE_LEGACY_API)
-      enableHistoricalMode: false,  // Enable storage-backed historical queries (NUXT_PUBLIC_ENABLE_HISTORICAL_MODE)
+      // Historical mode is on iff DATABASE_URL is set. Derived at boot so the
+      // client-side flag can never drift from the server. There is no separate
+      // NUXT_PUBLIC_ENABLE_HISTORICAL_MODE env var — set DATABASE_URL to enable both.
+      enableHistoricalMode: !!process.env.DATABASE_URL,
       hiddenTabs: '',  // Comma-separated list of tab names to hide (NUXT_PUBLIC_HIDDEN_TABS)
       enableAiChat: true,  // Enable AI-powered chat for metrics Q&A (NUXT_PUBLIC_ENABLE_AI_CHAT)
       entraClientId: '',    // NUXT_PUBLIC_ENTRA_CLIENT_ID — app registration client ID for MSAL popup auth
       entraTenantId: '',    // NUXT_PUBLIC_ENTRA_TENANT_ID — tenant ID (defaults to 'common' for multi-tenant)
+      // Optional site-wide announcement banner. When set, an info banner with this
+      // text is shown at the top of the dashboard. Users can dismiss it for the
+      // current tab session. (NUXT_PUBLIC_ANNOUNCEMENT_MESSAGE)
+      announcementMessage: '',
     }
   }
 })

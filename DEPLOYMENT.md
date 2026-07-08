@@ -187,7 +187,6 @@ Adds PostgreSQL for persistent storage — enables metrics beyond 28 days, per-u
 export NUXT_GITHUB_TOKEN=github_pat_...    # Fine-grained PAT with "Copilot metrics" permission
 export NUXT_PUBLIC_GITHUB_ORG=your-org
 export NUXT_PUBLIC_IS_DATA_MOCKED=false
-export ENABLE_HISTORICAL_MODE=true
 
 # Start web app + database
 docker compose up web db
@@ -200,6 +199,8 @@ docker compose run --rm sync
 
 The sync service downloads all available historical data on first run. Subsequent runs (or the daily schedule) only sync the latest day.
 
+> **Alternative:** Instead of `NUXT_GITHUB_TOKEN`, you can use GitHub App authentication with `NUXT_GITHUB_APP_ID` and `NUXT_GITHUB_APP_PRIVATE_KEY`. This is recommended when using OAuth/external auth providers (Google, Microsoft, Auth0, Keycloak) since it decouples API access from individual user accounts.
+
 ### Enterprise Scope
 
 ```bash
@@ -207,7 +208,6 @@ export NUXT_GITHUB_TOKEN=github_pat_...
 export NUXT_PUBLIC_SCOPE=enterprise
 export NUXT_PUBLIC_GITHUB_ENT=your-enterprise
 export NUXT_PUBLIC_IS_DATA_MOCKED=false
-export ENABLE_HISTORICAL_MODE=true
 
 docker compose up web db
 docker compose run --rm sync
@@ -299,7 +299,12 @@ These endpoints respond in ~200ms without making external API calls and do not r
 
 ### Admin Sync API
 
-When running in Historical mode, the web app exposes a manual sync endpoint for backfilling or repairing data. If the app is configured with `NUXT_GITHUB_TOKEN`, the Authorization header is optional (the server uses its own token).
+When running in Historical mode, the web app exposes a manual sync endpoint for backfilling or repairing data. 
+
+**Authentication:** The endpoint supports three authentication modes:
+1. **Server credentials** — If the app is configured with `NUXT_GITHUB_TOKEN` (PAT) or `NUXT_GITHUB_APP_ID` + `NUXT_GITHUB_APP_PRIVATE_KEY` (GitHub App), the Authorization header is optional (the server uses its own credentials).
+2. **Pass-through auth** — Even when OAuth/external auth is enabled, you can pass a GitHub token directly via the `Authorization: Bearer <github-token>` header (a classic PAT may also be sent as `Authorization: token <github-token>`), bypassing the user session requirement.
+3. **User session** — When logged in via OAuth, the endpoint uses the authenticated user's GitHub access token automatically.
 
 > **Note:** The GitHub Copilot Metrics API provides historical data well beyond the 28-day rolling window. The 1-day endpoint supports dates going back many months, so `sync-date`, `sync-range`, and `sync-gaps` can all backfill historical data. The 28-day limit only applies to `sync-last-28` (which uses the bulk download endpoint).
 
@@ -351,19 +356,67 @@ curl -X POST http://localhost:3000/api/admin/sync \
 # → {"action":"sync-gaps","gapsDetected":82,"gapsFilled":80,"outsideWindow":0,"failureCount":2,"results":[...]}
 ```
 
+**`sync-billing-csv`** — Trigger an asynchronous AI-credit billing CSV export for the configured enterprise (default window: last 30 days). Admin-only and fire-and-forget — returns a `jobId` immediately while the ingester runs in the background. Poll `GET /api/admin/sync-status` to see progress in the `billingCsv` block. Requires `NUXT_GITHUB_BILLING_TOKEN` + `NUXT_BILLING_ENTERPRISE` and database mode.
+
+```bash
+curl -X POST http://localhost:3000/api/admin/sync \
+  -H "Content-Type: application/json" \
+  -d '{"action":"sync-billing-csv"}'
+# → {"action":"sync-billing-csv","jobId":42,"enterprise":"acme-ent","startDate":"2026-05-27","endDate":"2026-06-26","status":"queued"}
+```
+
+**`sync-billing-csv-range`** — Same as `sync-billing-csv` but for an arbitrary `since`/`until` window. The ingester automatically chunks into 31-day segments (GitHub's per-export cap) and aggregates row counts on a single audit-table row. GitHub enforces enterprise-wide single-flight across billing exports — a 409 is returned if another job is already in flight. Use this for historical backfill from the UI or scripts.
+
+```bash
+curl -X POST http://localhost:3000/api/admin/sync \
+  -H "Content-Type: application/json" \
+  -d '{"action":"sync-billing-csv-range","since":"2026-01-01","until":"2026-06-30"}'
+```
+
+**`sync-billing-csv-cancel`** — Marks any in-flight billing CSV jobs for the configured enterprise as `cancelled` in the audit table. Does NOT interrupt the in-flight HTTP poll/download — it primarily clears a stuck-looking job from the Admin Panel so the next trigger can proceed without hitting the single-flight unique index.
+
+```bash
+curl -X POST http://localhost:3000/api/admin/sync \
+  -H "Content-Type: application/json" \
+  -d '{"action":"sync-billing-csv-cancel"}'
+# → {"action":"sync-billing-csv-cancel","cancelled":1}
+```
+
+#### Billing CSV ingest (database mode only)
+
+The async CSV export endpoint returns line-level data (one row per user × day × SKU × org × repo × model) that the synchronous JSON billing endpoint does not surface — including per-user attribution, `premium_request` SKUs, organization/repository breakdown, and full historical depth. Ingestion is **database-mode only**: rows land in the `billing_credit_usage` table and the read endpoints (`/api/billing-credits`, `/api/billing-credits-by-user`) will be wired to prefer DB rows when present in a follow-up phase.
+
+Triggers:
+1. **Sync container** — runs after the regular metrics sync on every cron tick. Default 30-day window (override with `BILLING_CSV_DAYS_BACK`). Configure on the existing CronJob — no new infrastructure required.
+2. **Admin Panel** — buttons under the "Billing CSV ingest" section of the Admin Panel. "Sync last 30 days" for normal runs, since/until pickers for backfill, plus a Cancel button visible while a job is in flight.
+3. **HTTP API** — the three actions documented above.
+
+The ingester state machine: `queued → processing → downloading → upserting → completed` (or `failed` / `cancelled`). Each chunk uses a single transaction that deletes existing rows for the window before re-inserting, so re-runs are idempotent and upstream data corrections propagate.
+
+Required environment for billing ingest:
+- `NUXT_GITHUB_BILLING_TOKEN` — classic PAT with `manage_billing:enterprise` scope, SSO-authorized for the target enterprise. Same token used by `/api/billing-credits`.
+- `NUXT_BILLING_ENTERPRISE` — enterprise slug (e.g. `acme-ent`).
+- `BILLING_CSV_DAYS_BACK` — optional, default `30`. Sync container uses this as its window each tick.
+- Database mode — set `DATABASE_URL` (or valid `PG*` env vars). Setting `DATABASE_URL` alone enables historical mode.
+
+If these are not set, the sync container logs `Billing CSV ingest skipped` and exits 0; the admin endpoints return 503 with a clear "configure X" message. No regression for deployments not opted into billing ingest.
+
 ## Environment Variables Reference
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `NUXT_GITHUB_TOKEN` | GitHub PAT with Copilot metrics permission | Yes (PAT mode) |
+| `NUXT_GITHUB_TOKEN` | GitHub PAT (fine-grained or classic) or fallback for billing — metrics endpoints | Yes (PAT mode) |
+| `NUXT_GITHUB_BILLING_TOKEN` | **Classic** PAT with `manage_billing:enterprise`, SSO-authorized for the target enterprise. Required for the Billing tab to show real data and for the My Usage "Your AI credit spend" card. When unset, the Billing tab is shown to all users as a configuration-help placeholder; the My Usage spend card is hidden. | Optional |
+| `NUXT_BILLING_ENTERPRISE` | Enterprise slug. When set, billing calls always go to `/enterprises/{slug}/...` regardless of dashboard scope. Required for org-scoped dashboards whose org is enterprise-owned (otherwise billing returns 404). | Optional |
 | `NUXT_PUBLIC_SCOPE` | `organization` or `enterprise` (legacy `team-organization`/`team-enterprise` have been removed; existing values are auto-normalized) | Yes |
 | `NUXT_PUBLIC_GITHUB_ORG` | GitHub organization slug | For org scope |
 | `NUXT_PUBLIC_GITHUB_ENT` | GitHub enterprise slug | For enterprise scope |
 | `NUXT_SESSION_PASSWORD` | Session encryption key (min 32 chars) | Yes |
-| `DATABASE_URL` | PostgreSQL connection string | Historical mode only |
-| `ENABLE_HISTORICAL_MODE` | `true` to read metrics from database | Historical mode only |
-| `SYNC_ENABLED` | `true` for sync service, `false` for web app | Historical mode only |
+| `DATABASE_URL` | PostgreSQL connection string. **Setting this alone enables historical mode** (DB-backed reads, `/api/*-history` endpoints, Teams tab). | Historical mode only |
 | `SYNC_DAYS_BACK` | Days to sync (default: 1 for daily, 28 for bulk) | Sync only |
+| `NUXT_GITHUB_BILLING_TOKEN` | Classic PAT with `manage_billing:enterprise` (SSO-authorized) used by `/api/billing-credits*` and the async CSV ingest. | Billing |
+| `NUXT_BILLING_ENTERPRISE` | Enterprise slug to query for billing endpoints (overrides dashboard scope). | Billing |
+| `BILLING_CSV_DAYS_BACK` | Window (in days) the sync container ingests on each tick (default: `30`). | Billing CSV |
 | `NUXT_PUBLIC_AUTH_PROVIDERS` | Comma-separated active providers: `github`, `google`, `microsoft`, `auth0`, `keycloak` — setting this enables authentication | OAuth mode |
 | `NUXT_OAUTH_GITHUB_CLIENT_ID` | GitHub App client ID | GitHub OAuth |
 | `NUXT_OAUTH_GITHUB_CLIENT_SECRET` | GitHub App client secret | GitHub OAuth |
@@ -381,8 +434,10 @@ curl -X POST http://localhost:3000/api/admin/sync \
 | `NUXT_OAUTH_KEYCLOAK_REALM` | Keycloak realm name | Keycloak OAuth |
 | `NUXT_AUTHORIZED_USERS` | Comma-separated logins/emails allowed to log in (any provider) | Optional |
 | `NUXT_AUTHORIZED_EMAIL_DOMAINS` | Comma-separated email domains allowed, e.g. `company.com` | Optional |
+| `NUXT_USAGE_ADMINS` | Comma-separated logins/emails granted admin privileges. Admins see the **Billing tab** + **all users' rows** on User Metrics/Seats. Non-admins see only their own row (per [issue #398](https://github.com/github-copilot-resources/copilot-metrics-viewer/issues/398)). **Closed-by-default** in 3.11.0+ — empty value means NO admins. **PAT-mode deployments** (no OAuth configured) are exempt: every caller is treated as admin because there is no per-user identity to gate on, so lock such deployments down at the network layer (e.g. `PREVIEW_ALLOWED_IPS`). | Optional |
 | `NUXT_PUBLIC_ENTRA_CLIENT_ID` | App registration client ID for MSAL manager filter | Entra filter |
 | `NUXT_PUBLIC_ENTRA_TENANT_ID` | Tenant ID for MSAL (default: `common` for multi-tenant) | Entra filter |
+| `NUXT_APP_BASE_URL` | Base URL path for sub-path deployments, e.g. `/copilot-metrics-viewer/` | Sub-path proxy |
 
 ## Authentication
 
@@ -400,6 +455,15 @@ The PAT must have the following scopes:
 - `read:org` — read organization membership
 - `copilot` — read Copilot usage
 - `manage_billing:copilot` — read seat management (optional)
+
+For the **Billing tab** and **per-user AI credit spend on My Usage**, set a *separate* classic PAT:
+
+```bash
+NUXT_GITHUB_BILLING_TOKEN=ghp_classic_pat_with_manage_billing_enterprise
+NUXT_BILLING_ENTERPRISE=my-enterprise-slug   # required when an org is enterprise-owned
+```
+
+Billing endpoints require a classic PAT with `manage_billing:enterprise` (or `manage_billing:copilot`) and SSO authorization for the target enterprise. Fine-grained PATs and GitHub Apps cannot read billing today, which is why `NUXT_GITHUB_BILLING_TOKEN` is separate from `NUXT_GITHUB_TOKEN` — your metrics calls can keep using a GitHub App while only billing uses the classic PAT.
 
 In PAT mode the toolbar shows a shield icon (🛡) that explains available OAuth options when clicked.
 
@@ -429,6 +493,12 @@ A GitHub App installation token lets the backend fetch Copilot data **without an
    - `Members` → Read-only (for seat analysis)
 6. Set "Where can this GitHub App be installed?" → **Only on this account**
 7. Click **Create GitHub App**, then note the **App ID** on the next page
+
+> **Note:** GitHub Apps cannot read billing — the Billing tab requires a
+> separate classic PAT with `manage_billing:enterprise` (or
+> `manage_billing:copilot`) configured via `NUXT_GITHUB_BILLING_TOKEN`.
+> Do not add `Administration` or `Enterprise billing` permissions here:
+> they will not enable the Billing tab.
 
 **Generate a private key:**
 
@@ -602,6 +672,7 @@ After a user authenticates with any provider, you can optionally restrict which 
 |---|---|
 | `NUXT_AUTHORIZED_USERS` | Comma-separated logins or emails: `alice,bob@company.com` |
 | `NUXT_AUTHORIZED_EMAIL_DOMAINS` | Comma-separated domains: `company.com,corp.org` |
+| `NUXT_USAGE_ADMINS` | Comma-separated logins or emails: `alice,bob@company.com`. **Closed-by-default in OAuth-mode deployments** — leaving it empty hides the Billing tab and restricts User Metrics to each caller's own row. PAT-mode deployments (no OAuth provider configured) bypass this gate. No domain-wildcard support. |
 
 When **both are empty** (default), all authenticated users are allowed. When either is set, a user must match at least one rule to gain access.
 
@@ -654,3 +725,46 @@ NUXT_PUBLIC_ENTRA_TENANT_ID=common
 > `https://login.microsoftonline.com/{tenant-id}/adminconsent?client_id={client-id}`
 > After that, all users in the tenant can use the filter without any further prompts.
 
+## Sub-path Deployment (Reverse Proxy)
+
+If you deploy the app under a URL sub-path (e.g., `https://your-host/copilot-metrics-viewer`), set the `NUXT_APP_BASE_URL` environment variable so the app generates correct links and redirects.
+
+```bash
+NUXT_APP_BASE_URL=/copilot-metrics-viewer/
+```
+
+> [!IMPORTANT]
+> The trailing slash is required.
+
+When `NUXT_APP_BASE_URL` is set:
+- Sign-in links point to `<base>/auth/<provider>` instead of `/auth/<provider>`
+- Post-authentication redirects go to the correct sub-path
+- MSAL popup redirect URIs include the sub-path (update Azure App Registration accordingly)
+
+### Reverse Proxy Configuration
+
+Your reverse proxy must strip the sub-path prefix before forwarding requests to the Nitro server. Set `NUXT_APP_BASE_URL` on the container so the app generates correct absolute links for auth redirects and sign-in buttons.
+
+**Nginx example** — the trailing slash on `proxy_pass` causes Nginx to rewrite `/copilot-metrics-viewer/foo` → `/foo` before forwarding to the server:
+```nginx
+location /copilot-metrics-viewer/ {
+    proxy_pass http://localhost:3000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+**Azure Application Gateway** (path-based routing): Configure the backend HTTP settings with a URL rewrite rule that removes the `/copilot-metrics-viewer/` prefix before forwarding to the container. Set `NUXT_APP_BASE_URL=/copilot-metrics-viewer/` on the container so the app generates correct absolute links.
+
+### OAuth Redirect URIs for Sub-path Deployments
+
+When using OAuth providers, update your redirect URIs to include the sub-path:
+
+| Provider | Redirect URI |
+|----------|-------------|
+| GitHub | `https://your-host/copilot-metrics-viewer/auth/github` |
+| Google | `https://your-host/copilot-metrics-viewer/auth/google` |
+| Microsoft | `https://your-host/copilot-metrics-viewer/auth/microsoft` |
+| Auth0 | `https://your-host/copilot-metrics-viewer/auth/auth0` |
+| Keycloak | `https://your-host/copilot-metrics-viewer/auth/keycloak` |
+| MSAL popup | `https://your-host/copilot-metrics-viewer/api/msal/callback` |

@@ -50,18 +50,12 @@ spec:
               name: copilot-metrics-secrets
               key: session-password
         
-        # Historical mode with PostgreSQL
-        - name: ENABLE_HISTORICAL_MODE
-          value: "true"
+        # Historical mode with PostgreSQL — enabled by setting DATABASE_URL
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
               name: copilot-metrics-secrets
               key: database-url
-        
-        # Disable built-in sync (use CronJob instead)
-        - name: SYNC_ENABLED
-          value: "false"
         
         resources:
           requests:
