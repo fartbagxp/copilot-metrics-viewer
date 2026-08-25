@@ -9,6 +9,9 @@
 set -euo pipefail
 
 HOST="${1:-http://localhost:3000}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 # Load .env then .env.local (local overrides base)
 SCOPE="" GITHUB_ORG="" GITHUB_ENT=""
@@ -40,8 +43,8 @@ if [ -z "$IDENTIFIER" ]; then
   exit 1
 fi
 
-if ! curl -sf "$HOST/api/health" >/dev/null 2>&1; then
-  echo "Error: server is not responding at $HOST"
+if ! app_is_healthy "$HOST"; then
+  report_unhealthy_host "$HOST"
   exit 1
 fi
 
