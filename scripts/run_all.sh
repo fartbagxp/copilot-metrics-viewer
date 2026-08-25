@@ -11,6 +11,8 @@ set -euo pipefail
 HOST="${1:-http://localhost:3000}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
 SERVER_PID=""
 SERVER_WE_STARTED=false
 
@@ -19,7 +21,7 @@ SERVER_WE_STARTED=false
 wait_for_server() {
   echo "Waiting for server at $HOST ..."
   for i in $(seq 1 30); do
-    if curl -sf "$HOST/api/health" >/dev/null 2>&1; then
+    if app_is_healthy "$HOST"; then
       echo "Server is up."
       return 0
     fi
@@ -52,8 +54,13 @@ trap cleanup EXIT
 
 # --- start server if not already running ---
 
-if curl -sf "$HOST/api/health" >/dev/null 2>&1; then
+if app_is_healthy "$HOST"; then
   echo "Server already running at $HOST"
+elif host_responds "$HOST"; then
+  # The port is taken by something that is not us — starting our own server
+  # would only fail to bind and then time out against the impostor.
+  report_unhealthy_host "$HOST"
+  exit 1
 else
   echo "Starting server ..."
   cd "$REPO_ROOT"

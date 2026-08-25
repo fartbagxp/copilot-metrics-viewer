@@ -7,6 +7,9 @@
 set -euo pipefail
 
 HOST="${1:-http://localhost:3000}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 # Load .env then .env.local (local overrides base), pulling only the vars we need
 SCOPE="" GITHUB_ORG="" GITHUB_ENT=""
@@ -40,8 +43,8 @@ if [ -z "$IDENTIFIER" ]; then
 fi
 
 # Check the server is reachable
-if ! curl -sf "$HOST/api/health" >/dev/null 2>&1; then
-  echo "Error: server is not responding at $HOST"
+if ! app_is_healthy "$HOST"; then
+  report_unhealthy_host "$HOST"
   exit 1
 fi
 
@@ -49,9 +52,31 @@ echo "Syncing last 28 days for $SCOPE:$IDENTIFIER ..."
 RESPONSE=$(curl -s -X POST "$HOST/api/admin/sync?action=sync-last-28&scope=$SCOPE&$ID_PARAM")
 echo "$RESPONSE"
 
-# Surface errors clearly
-if echo "$RESPONSE" | grep -q '"success":false'; then
-  echo ""
-  echo "Warning: sync reported errors — check the response above"
+# Surface errors clearly. Parsing (rather than grepping for '"success":false')
+# means a response that is not this endpoint's JSON at all — an HTML error page,
+# a login redirect — fails loudly instead of passing as a successful sync.
+if ! printf '%s' "$RESPONSE" | node -e "
+const chunks = [];
+process.stdin.on('data', d => chunks.push(d));
+process.stdin.on('end', () => {
+  let d;
+  try {
+    d = JSON.parse(chunks.join(''));
+  } catch {
+    console.error('');
+    console.error('Error: sync response was not valid JSON — see the response above');
+    process.exit(1);
+  }
+  if (d.success !== true) {
+    const errors = Array.isArray(d.errors) ? d.errors : [];
+    console.error('');
+    console.error('Error: sync reported failure' + (errors.length ? ' (' + errors.length + ' error(s))' : ''));
+    for (const e of errors) console.error('  ' + e.date + ': ' + e.error);
+    process.exit(1);
+  }
+  console.log('');
+  console.log('Sync OK: ' + d.savedDays + ' saved, ' + d.skippedDays + ' skipped, of ' + d.totalDays + ' day(s).');
+});
+"; then
   exit 1
 fi
